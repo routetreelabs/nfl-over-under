@@ -15,7 +15,7 @@ st.set_page_config(page_title="NFL Totals KNN Predictor", layout="wide")
 
 @st.cache_data
 def load_data():
-    df = pd.read_csv("nfl_cleaned_for_modeling_2015-2024.csv")
+    df = pd.read_csv("nfl_cleaned_for_modeling_2015-2024-Copy1.csv")
     df = df.sort_values(by=['Season','Week']).reset_index(drop=True)
     df['True_Total'] = df['Tm_Pts'] + df['Opp_Pts']
     df['Over'] = np.where(df['True_Total'] > df['Total'], 1, 0)
@@ -88,7 +88,7 @@ def predict_week(df, season=2025, week=1):
     return X_new
 
 # === Streamlit UI ===
-st.title("🏈 NFL KNN Week 1 Totals Predictor")
+st.title("NFL KNN Week 1 Totals Predictor")
 df = load_data()
 pred_df = predict_week(df)
 
