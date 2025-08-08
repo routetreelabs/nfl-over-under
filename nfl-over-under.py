@@ -30,10 +30,11 @@ def load_data():
 def predict_week(df, season=2025, week=1):
     features = ['Spread', 'Total']
     target = 'Under'
-    df = df.query('Home == 1').reset_index(drop=True)
 
-    train_df = df.query('Season < @season or (Season == @season and Week < @week)')
+    # Load frozen, preprocessed training data (exported from notebook)
+    train_df = pd.read_csv("final_knn_training_set.csv")
     train_df = train_df.sort_values(['Season', 'Week', 'Tm_Name']).reset_index(drop=True)
+
     X_train = train_df[features].astype(float).round(4)
     y_train = train_df[target]
 
