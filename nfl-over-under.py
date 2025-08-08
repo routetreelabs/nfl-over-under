@@ -1,21 +1,57 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[ ]:
+# nfl-over-under.py  (Streamlit)
 
-
-# nfl_knn_app.py
-
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
 import sklearn
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import pairwise_distances
 
+# Optional: make CPU math boring/predictable (must be set before NumPy import in a fresh run)
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+st.set_page_config(page_title="NFL Totals KNN Predictor", layout="wide")
+
+# Sidebar env info
+st.sidebar.markdown("**Environment**")
 st.sidebar.text(f"pandas: {pd.__version__}")
 st.sidebar.text(f"sklearn: {sklearn.__version__}")
 
-st.set_page_config(page_title="NFL Totals KNN Predictor", layout="wide")
+########################
+# Deterministic KNN helper
+########################
+def knn_predict_stable(X_train, y_train, X_query, k=7):
+    """
+    Deterministic KNN:
+      - exact distances via pairwise_distances (single-threaded)
+      - stable sort by distance (ties broken by row index)
+      - uniform voting like sklearn; tie -> lowest class label
+    Returns: preds, distances[(nq,k)], indices[(nq,k)]
+    """
+    Xt = np.ascontiguousarray(X_train, dtype=np.float64)
+    Xq = np.ascontiguousarray(X_query, dtype=np.float64)
+    y  = np.asarray(y_train)
+
+    # Distances: (n_train, n_query)
+    D = pairwise_distances(Xt, Xq, metric="euclidean", n_jobs=1)
+    # Stable sort by distance per column
+    order = np.argsort(D, axis=0, kind="mergesort")   # (n_train, n_query)
+    ind = order[:k].T                                 # (n_query, k)
+    dist = np.take_along_axis(D.T, ind, axis=1)       # (n_query, k)
+
+    # sklearn-style uniform voting
+    preds = []
+    max_label = int(np.max(y)) if y.size else 1
+    for nbr_idx in ind:
+        votes = np.bincount(y[nbr_idx].astype(int), minlength=max_label + 1)
+        pred = np.flatnonzero(votes == votes.max())[0]  # lowest label wins ties
+        preds.append(pred)
+    return np.array(preds), dist, ind
 
 @st.cache_data
 def load_data():
@@ -31,13 +67,15 @@ def predict_week(df, season=2025, week=1):
     features = ['Spread', 'Total']
     target = 'Under'
 
-    # Load frozen, preprocessed training data (exported from notebook)
-    train_df = pd.read_csv("final_knn_training_set.csv")
+    # Build training set with deterministic row order to make tie-break fallback consistent
+    train_df = df.query('Season < @season or (Season == @season and Week < @week)')
     train_df = train_df.sort_values(['Season', 'Week', 'Tm_Name']).reset_index(drop=True)
 
-    X_train = train_df[features].astype(float).round(4)  # <- if possible, avoid rounding here
-    y_train = train_df[target]
+    # Use full precision float64 for the model (do NOT round before fit)
+    X_train_np = np.ascontiguousarray(train_df[features].to_numpy(dtype="float64"))
+    y_train_np = train_df[target].to_numpy()
 
+    # Incoming Week 1 (home-team perspective games you had)
     week1 = [
         ['Cowboys @ Eagles', -6.5, 46.5], ['Chiefs @ Chargers', +2.5, 45.5],
         ['Giants @ Commanders', -6.5, 45.5], ['Panthers @ Jaguars', -2.5, 46.5],
@@ -49,61 +87,38 @@ def predict_week(df, season=2025, week=1):
         ['Ravens @ Bills', -1.5, 51.5], ['Vikings @ Bears', -1.5, 43.5]
     ]
     X_new = pd.DataFrame(week1, columns=['Game', 'Spread', 'Total'])
-    X_new[['Spread', 'Total']] = X_new[['Spread', 'Total']].astype(float).round(4)
+    X_new_np = np.ascontiguousarray(X_new[['Spread','Total']].to_numpy(dtype="float64"))
 
-    # === DIAGNOSTICS (place runs HERE; same spot locally in notebook) ===
-    from sklearn.metrics import pairwise_distances
-    k = 7
-    # use the first query (pick any specific one you’ve been testing)
-    xq = X_new[['Spread','Total']].iloc[0:1].to_numpy(dtype='float64')
-    Xt = X_train.to_numpy(dtype='float64')
-    D = pairwise_distances(Xt, xq, metric='euclidean', n_jobs=1).ravel()
-    kth = np.partition(D, k-1)[k-1]
-    ties = int(np.sum(np.isclose(D, kth, rtol=0, atol=0)))
-    st.sidebar.text(f"kth dist: {kth:.10f} | ties@k: {ties}")
+    # --- Diagnostics in the sidebar (same as you ran) ---
+    try:
+        k = 7
+        xq = X_new_np[0:1]
+        D = pairwise_distances(X_train_np, xq, metric='euclidean', n_jobs=1).ravel()
+        cut = np.partition(D, k-1)[k-1]
+        ties = int(np.sum(np.isclose(D, cut, rtol=0, atol=0)))
+        st.sidebar.text(f"kth dist: {cut:.10f} | ties@k: {ties}")
+        order = np.argsort(D, kind="mergesort")
+        st.sidebar.text("nearest 10 dists: " + ", ".join(f"{D[i]:.6f}" for i in order[:10]))
+    except Exception as e:
+        st.sidebar.text(f"diag error: {e}")
 
-    # Optional: show a few distances around the cutoff
-    order = np.argsort(D, kind="mergesort")
-    st.sidebar.text("nearest 10 dists: " + ", ".join(f"{D[i]:.6f}" for i in order[:10]))
-
-    # === (OPTIONAL) deterministic/top-k stable helper ===
-    def kneighbors_stable(Xt64, Xq64, k):
-        # exact distances, stable sort by (distance, index)
-        Dfull = pairwise_distances(Xt64, Xq64, metric='euclidean', n_jobs=1)  # (n_train, n_query)
-        order = np.argsort(Dfull, axis=0, kind="mergesort")  # stable
-        ind = order[:k].T
-        # distances aligned to chosen indices
-        dist = np.take_along_axis(Dfull.T, ind, axis=1)
-        return dist, ind
-
-    # === MODEL (baseline) ===
-    model = KNeighborsClassifier(n_neighbors=7, algorithm="brute", metric="euclidean", n_jobs=1)
-    clf = model.fit(X_train, y_train)
-
-    X_new_features = X_new[['Spread', 'Total']]
-
-    # swap to stable selection by toggling this flag
-    USE_STABLE = False
-    if USE_STABLE:
-        distances, indices = kneighbors_stable(
-            X_train.to_numpy(dtype='float64'),
-            X_new_features.to_numpy(dtype='float64'),
-            k=7
-        )
-    else:
-        distances, indices = clf.kneighbors(X_new_features)
-
-    raw_preds = clf.predict(X_new_features)
+    # --- Deterministic neighbors + predictions ---
+    raw_preds, distances, indices = knn_predict_stable(X_train_np, y_train_np, X_new_np, k=7)
     X_new['Prediction'] = ['Under' if p == 1 else 'Over' for p in raw_preds]
 
-    confidence_percents, avg_distances, confidence_scores, neighbors_info = [], [], [], []
+    # --- Confidence/neighbor analysis (your original logic) ---
+    confidence_percents = []
+    avg_distances = []
+    confidence_scores = []
+    neighbors_info = []
+
     for i in range(len(X_new)):
         neighbor_idxs = indices[i]
         neighbor_dists = distances[i]
-        neighbor_labels = y_train.iloc[neighbor_idxs].values
+        neighbor_labels = y_train_np[neighbor_idxs]
 
         prediction_label = 1 if X_new.loc[i, 'Prediction'] == 'Under' else 0
-        agreeing = np.sum(neighbor_labels == prediction_label)
+        agreeing = int(np.sum(neighbor_labels == prediction_label))
         confidence_percent = agreeing / len(neighbor_labels)
         avg_distance = float(np.mean(neighbor_dists))
         confidence_score = (confidence_percent * 100) * (1 - avg_distance)
@@ -123,19 +138,18 @@ def predict_week(df, season=2025, week=1):
 
     return X_new
 
-
 # === Streamlit UI ===
 st.title("NFL KNN Week 1 Totals Predictor")
+
 df = load_data()
 pred_df = predict_week(df)
 
 st.subheader("Predictions for Week 1 of the 2025 NFL Season")
 
-for idx, row in pred_df.iterrows():
+for _, row in pred_df.iterrows():
     with st.expander(f"{row['Game']} — Prediction: {row['Prediction']}"):
         st.write(f"**Spread:** {row['Spread']} | **Total:** {row['Total']}")
         st.write(f"**Prediction:** {row['Prediction']}")
         st.write(f"**Confidence %:** {row['ConfidencePercent']*100:.1f}%")
         st.write(f"**Avg Distance:** {row['AvgDistance']} | **Score:** {row['ConfidenceScore']:.1f}")
         st.dataframe(row['Neighbors'])
-
