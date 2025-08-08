@@ -11,6 +11,9 @@ import pandas as pd
 import numpy as np
 from sklearn.neighbors import KNeighborsClassifier
 
+st.sidebar.text(f"pandas: {pd.__version__}")
+st.sidebar.text(f"sklearn: {sklearn.__version__}")
+
 st.set_page_config(page_title="NFL Totals KNN Predictor", layout="wide")
 
 @st.cache_data
