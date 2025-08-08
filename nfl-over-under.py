@@ -1,19 +1,19 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# nfl-over-under.py  (Streamlit)
+# nfl-over-under.py  (Streamlit app)
 
+# --- Make CPU math predictable (set before NumPy/Sklearn imports) ---
 import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import sklearn
 from sklearn.metrics import pairwise_distances
-
-# Optional: make CPU math boring/predictable (must be set before NumPy import in a fresh run)
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 st.set_page_config(page_title="NFL Totals KNN Predictor", layout="wide")
 
@@ -22,60 +22,78 @@ st.sidebar.markdown("**Environment**")
 st.sidebar.text(f"pandas: {pd.__version__}")
 st.sidebar.text(f"sklearn: {sklearn.__version__}")
 
-########################
-# Deterministic KNN helper
-########################
-def knn_predict_stable(X_train, y_train, X_query, k=7):
+# -------------------------------
+# Deterministic KNN with RECENCY tie-break
+# -------------------------------
+def knn_predict_stable(X_train, y_train, X_query, seasons, weeks, k=7):
     """
-    Deterministic KNN:
-      - exact distances via pairwise_distances (single-threaded)
-      - stable sort by distance (ties broken by row index)
-      - uniform voting like sklearn; tie -> lowest class label
+    Deterministic KNN with *recency* tie-break:
+      primary:   distance (ascending)
+      secondary: Season  (descending -> newer first)
+      tertiary:  Week    (descending -> newer first)
+      fallback:  row index (ascending)
     Returns: preds, distances[(nq,k)], indices[(nq,k)]
     """
     Xt = np.ascontiguousarray(X_train, dtype=np.float64)
     Xq = np.ascontiguousarray(X_query, dtype=np.float64)
     y  = np.asarray(y_train)
 
+    n_train = Xt.shape[0]
+    row_idx = np.arange(n_train)
+    pr_season = np.asarray(seasons, dtype=np.int64)
+    pr_week   = np.asarray(weeks,   dtype=np.int64)
+
     # Distances: (n_train, n_query)
     D = pairwise_distances(Xt, Xq, metric="euclidean", n_jobs=1)
-    # Stable sort by distance per column
-    order = np.argsort(D, axis=0, kind="mergesort")   # (n_train, n_query)
-    ind = order[:k].T                                 # (n_query, k)
-    dist = np.take_along_axis(D.T, ind, axis=1)       # (n_query, k)
 
-    # sklearn-style uniform voting
-    preds = []
+    inds, dists = [], []
+    # np.lexsort: last key is primary
+    # order by: (row_idx ↑) after (-week ↓) after (-season ↓) after (distance ↑)
+    for j in range(D.shape[1]):
+        order = np.lexsort((row_idx, -pr_week, -pr_season, D[:, j]))
+        take = order[:k]
+        inds.append(take)
+        dists.append(D[take, j])
+
+    ind  = np.stack(inds, axis=0)   # (n_query, k)
+    dist = np.stack(dists, axis=0)  # (n_query, k)
+
+    # sklearn-style uniform voting; ties -> lowest class label
     max_label = int(np.max(y)) if y.size else 1
+    preds = []
     for nbr_idx in ind:
         votes = np.bincount(y[nbr_idx].astype(int), minlength=max_label + 1)
-        pred = np.flatnonzero(votes == votes.max())[0]  # lowest label wins ties
-        preds.append(pred)
+        preds.append(np.flatnonzero(votes == votes.max())[0])
     return np.array(preds), dist, ind
+
 
 @st.cache_data
 def load_data():
     df = pd.read_csv("nfl_cleaned_for_modeling_2015-2024-Copy1.csv")
-    df = df.sort_values(by=['Season','Week']).reset_index(drop=True)
+    df = df.sort_values(by=['Season', 'Week']).reset_index(drop=True)
     df['True_Total'] = df['Tm_Pts'] + df['Opp_Pts']
     df['Over'] = np.where(df['True_Total'] > df['Total'], 1, 0)
     df['Under'] = np.where(df['True_Total'] < df['Total'], 1, 0)
     df['Push'] = np.where(df['True_Total'] == df['Total'], 1, 0)
     return df
 
+
 def predict_week(df, season=2025, week=1):
     features = ['Spread', 'Total']
     target = 'Under'
 
-    # Build training set with deterministic row order to make tie-break fallback consistent
+    # Training set up to the chosen week (home-team rows only if that's your convention upstream)
     train_df = df.query('Season < @season or (Season == @season and Week < @week)')
+    # Deterministic order just for reproducible fallback when *all* keys tie
     train_df = train_df.sort_values(['Season', 'Week', 'Tm_Name']).reset_index(drop=True)
 
-    # Use full precision float64 for the model (do NOT round before fit)
+    # Full precision for the model (do NOT round before fit)
     X_train_np = np.ascontiguousarray(train_df[features].to_numpy(dtype="float64"))
     y_train_np = train_df[target].to_numpy()
+    seasons_np = train_df['Season'].to_numpy()
+    weeks_np   = train_df['Week'].to_numpy()
 
-    # Incoming Week 1 (home-team perspective games you had)
+    # Incoming games (home-team perspective)
     week1 = [
         ['Cowboys @ Eagles', -6.5, 46.5], ['Chiefs @ Chargers', +2.5, 45.5],
         ['Giants @ Commanders', -6.5, 45.5], ['Panthers @ Jaguars', -2.5, 46.5],
@@ -87,9 +105,9 @@ def predict_week(df, season=2025, week=1):
         ['Ravens @ Bills', -1.5, 51.5], ['Vikings @ Bears', -1.5, 43.5]
     ]
     X_new = pd.DataFrame(week1, columns=['Game', 'Spread', 'Total'])
-    X_new_np = np.ascontiguousarray(X_new[['Spread','Total']].to_numpy(dtype="float64"))
+    X_new_np = np.ascontiguousarray(X_new[['Spread', 'Total']].to_numpy(dtype="float64"))
 
-    # --- Diagnostics in the sidebar (same as you ran) ---
+    # --- Diagnostics (use the first query like before) ---
     try:
         k = 7
         xq = X_new_np[0:1]
@@ -102,11 +120,14 @@ def predict_week(df, season=2025, week=1):
     except Exception as e:
         st.sidebar.text(f"diag error: {e}")
 
-    # --- Deterministic neighbors + predictions ---
-    raw_preds, distances, indices = knn_predict_stable(X_train_np, y_train_np, X_new_np, k=7)
+    # --- Deterministic neighbors + predictions with RECENCY tie-break ---
+    raw_preds, distances, indices = knn_predict_stable(
+        X_train_np, y_train_np, X_new_np,
+        seasons=seasons_np, weeks=weeks_np, k=7
+    )
     X_new['Prediction'] = ['Under' if p == 1 else 'Over' for p in raw_preds]
 
-    # --- Confidence/neighbor analysis (your original logic) ---
+    # --- Confidence/neighbor analysis (same as before) ---
     confidence_percents = []
     avg_distances = []
     confidence_scores = []
@@ -138,6 +159,7 @@ def predict_week(df, season=2025, week=1):
 
     return X_new
 
+
 # === Streamlit UI ===
 st.title("NFL KNN Week 1 Totals Predictor")
 
@@ -147,9 +169,4 @@ pred_df = predict_week(df)
 st.subheader("Predictions for Week 1 of the 2025 NFL Season")
 
 for _, row in pred_df.iterrows():
-    with st.expander(f"{row['Game']} — Prediction: {row['Prediction']}"):
-        st.write(f"**Spread:** {row['Spread']} | **Total:** {row['Total']}")
-        st.write(f"**Prediction:** {row['Prediction']}")
-        st.write(f"**Confidence %:** {row['ConfidencePercent']*100:.1f}%")
-        st.write(f"**Avg Distance:** {row['AvgDistance']} | **Score:** {row['ConfidenceScore']:.1f}")
-        st.dataframe(row['Neighbors'])
+    with st.expander(f"{row['Game']} — Prediction: {row['Prediction']}"
