@@ -9,6 +9,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import sklearn
 from sklearn.neighbors import KNeighborsClassifier
 
 st.sidebar.text(f"pandas: {pd.__version__}")
