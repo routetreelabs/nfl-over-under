@@ -169,4 +169,10 @@ pred_df = predict_week(df)
 st.subheader("Predictions for Week 1 of the 2025 NFL Season")
 
 for _, row in pred_df.iterrows():
-    with st.expander(f"{row['Game']} — Prediction: {row['Prediction']}"
+    with st.expander(f"{row['Game']} — Prediction: {row['Prediction']}"):
+        st.write(f"**Spread:** {row['Spread']} | **Total:** {row['Total']}")
+        st.write(f"**Prediction:** {row['Prediction']}")
+        st.write(f"**Confidence %:** {row['ConfidencePercent']*100:.1f}%")
+        st.write(f"**Avg Distance:** {row['AvgDistance']} | **Score:** {row['ConfidenceScore']:.1f}")
+        st.dataframe(row['Neighbors'])
+
